@@ -1,0 +1,145 @@
+version: '3.8'
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.8.0
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: 'ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg='
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    # AWS credentials (replace with your values or use .env file)
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+    # S3 bucket
+    S3_BUCKET: ${S3_BUCKET:-karina-ecommerce-lakehouse}
+    # Source DB connection
+    SOURCE_DB_HOST: source-postgres
+    SOURCE_DB_PORT: 5432
+    SOURCE_DB_NAME: ecommerce
+    SOURCE_DB_USER: ecommerce_user
+    SOURCE_DB_PASSWORD: ecommerce_pass
+  volumes:
+    - ../airflow/dags:/opt/airflow/dags
+    - ../airflow/logs:/opt/airflow/logs
+    - ../airflow/plugins:/opt/airflow/plugins
+    - ../scripts:/opt/airflow/scripts
+    - ../requirements.txt:/requirements.txt
+  networks:
+    - streamcart-net
+  depends_on:
+    airflow-postgres:
+      condition: service_healthy
+
+services:
+
+  # ─── Source OLTP Database ──────────────────────────────────────────────────
+  source-postgres:
+    image: postgres:15
+    container_name: streamcart-source-db
+    environment:
+      POSTGRES_DB: ecommerce
+      POSTGRES_USER: ecommerce_user
+      POSTGRES_PASSWORD: ecommerce_pass
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - source_postgres_data:/var/lib/postgresql/data
+    networks:
+      - streamcart-net
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "ecommerce_user", "-d", "ecommerce"]
+      interval: 10s
+      retries: 5
+      start_period: 20s
+
+  # ─── Airflow Metadata Database ─────────────────────────────────────────────
+  airflow-postgres:
+    image: postgres:15
+    container_name: streamcart-airflow-db
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+    ports:
+      - "5434:5432"
+    volumes:
+      - airflow_postgres_data:/var/lib/postgresql/data
+    networks:
+      - streamcart-net
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 20s
+
+  # ─── Airflow Init (DB migrate + create admin user) ─────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: streamcart-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@streamcart.com \
+          --password admin
+        airflow variables set pipeline_mode incremental
+        airflow variables set last_cdc_watermark "2020-01-01 00:00:00"
+        airflow variables set s3_bucket "${S3_BUCKET:-karina-ecommerce-lakehouse}"
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+    restart: on-failure
+
+  # ─── Airflow Webserver ─────────────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: streamcart-airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ─── Airflow Scheduler ─────────────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: streamcart-airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  source_postgres_data:
+  airflow_postgres_data:
+
+networks:
+  streamcart-net:
+    driver: bridge
