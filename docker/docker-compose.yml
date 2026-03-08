@@ -14,7 +14,7 @@ x-airflow-common: &airflow-common
     # AWS credentials (replace with your values or use .env file)
     AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
     AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
-    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-eu-central-1}
     # S3 bucket
     S3_BUCKET: ${S3_BUCKET:-karina-ecommerce-lakehouse}
     # Source DB connection
@@ -37,7 +37,7 @@ x-airflow-common: &airflow-common
 
 services:
 
-  # ─── Source OLTP Database ──────────────────────────────────────────────────
+  # Source OLTP Database
   source-postgres:
     image: postgres:15
     container_name: streamcart-source-db
@@ -58,7 +58,7 @@ services:
       retries: 5
       start_period: 20s
 
-  # ─── Airflow Metadata Database ─────────────────────────────────────────────
+  # Airflow Metadata Database
   airflow-postgres:
     image: postgres:15
     container_name: streamcart-airflow-db
@@ -78,7 +78,7 @@ services:
       retries: 5
       start_period: 20s
 
-  # ─── Airflow Init (DB migrate + create admin user) ─────────────────────────
+  # Airflow Init (DB migrate + create admin user)
   airflow-init:
     <<: *airflow-common
     container_name: streamcart-airflow-init
@@ -102,7 +102,7 @@ services:
       _AIRFLOW_DB_MIGRATE: 'true'
     restart: on-failure
 
-  # ─── Airflow Webserver ─────────────────────────────────────────────────────
+  # Airflow Webserver
   airflow-webserver:
     <<: *airflow-common
     container_name: streamcart-airflow-webserver
@@ -120,7 +120,7 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
-  # ─── Airflow Scheduler ─────────────────────────────────────────────────────
+  # Airflow Scheduler
   airflow-scheduler:
     <<: *airflow-common
     container_name: streamcart-airflow-scheduler

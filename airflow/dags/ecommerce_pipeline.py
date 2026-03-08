@@ -18,7 +18,6 @@ notify_on_failure — failure callback on all tasks via default_args
 """
 
 from __future__ import annotations
-
 import json
 import logging
 from datetime import datetime, timedelta
@@ -30,11 +29,6 @@ from airflow.operators.bash import BashOperator
 from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
 
 log = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Failure callback — fires on ANY task failure
-# ---------------------------------------------------------------------------
 
 
 def notify_on_failure(context: dict) -> None:
@@ -84,8 +78,9 @@ def check_postgres_callable() -> bool:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM orders")
             count = cur.fetchone()[0]
-        log.info(f"Source DB reachable ✓  orders table has {count} rows")
+        log.info(f"Source DB reachable -  orders table has {count} rows")
         return True
+
     finally:
         conn.close()
 
@@ -113,7 +108,7 @@ def extract_cdc_callable(**context) -> dict:
     # After a successful FULL load → automatically reset to incremental
     if mode == "full":
         Variable.set("pipeline_mode", "incremental")
-        log.info("pipeline_mode reset to 'incremental' after full load ✓")
+        log.info("pipeline_mode reset to 'incremental' after full load")
 
     return result
 
@@ -132,10 +127,10 @@ def validate_extract_callable(**context) -> bool:
     log.info(f"rows_extracted={rows_extracted}  s3_uri={s3_uri}")
 
     if rows_extracted == 0 or s3_uri is None:
-        log.info("0 rows extracted — short-circuiting all downstream tasks ✓")
+        log.info("0 rows extracted — short-circuiting all downstream tasks")
         return False
 
-    log.info(f"Validation passed — {rows_extracted} rows ready for Glue ✓")
+    log.info(f"Validation passed — {rows_extracted} rows ready for Glue")
     return True
 
 
@@ -226,7 +221,7 @@ with DAG(
     validate_extract = ShortCircuitOperator(
         task_id="validate_extract",
         python_callable=validate_extract_callable,
-        retries=0,  # 0 rows is a valid outcome, no point retrying
+        retries=0,
     )
 
     trigger_glue_job = GlueJobOperator(
@@ -234,7 +229,7 @@ with DAG(
         job_name="{{ var.value.glue_job_name | default('streamcart-raw-to-curated') }}",
         script_location=None,
         aws_conn_id="aws_default",
-        region_name="us-east-1",
+        region_name="eu-central-1",
         script_args={
             "--S3_INPUT_PATH": (
                 "{{ ti.xcom_pull(task_ids='extract_cdc', key='cdc_result')"

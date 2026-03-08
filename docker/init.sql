@@ -1,9 +1,8 @@
 -- =============================================================================
--- StreamCart Analytics Platform
 -- Source Database DDL + Seed Data
 -- =============================================================================
 
--- Audit table for pipeline runs (used by Airflow task refresh_data_quality_summary)
+-- Audit table for pipeline runs
 CREATE TABLE IF NOT EXISTS pipeline_audit (
     id              SERIAL PRIMARY KEY,
     run_id          VARCHAR(100) NOT NULL,

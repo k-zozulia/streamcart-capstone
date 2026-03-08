@@ -4,21 +4,6 @@ Simulates ongoing e-commerce activity in the source PostgreSQL database.
 Each run:
   - Inserts  50–200 new orders (~90% clean, ~10% intentionally dirty)
   - Updates  10–30 existing orders
-
-Dirty rows exist so the ETL pipeline has something to quarantine:
-  - negative quantity
-  - negative unit_price
-  - invalid status
-
-Usage:
-    # Single run
-    python scripts/seed_updates.py
-
-    # Continuous loop (every 60 seconds)
-    python scripts/seed_updates.py --loop --interval 60
-
-    # Custom counts
-    python scripts/seed_updates.py --min-inserts 100 --max-inserts 200 --min-updates 20 --max-updates 30
 """
 
 import argparse
@@ -31,9 +16,8 @@ from datetime import datetime, timezone
 import psycopg2
 from psycopg2.extras import execute_values
 
-# ---------------------------------------------------------------------------
+
 # Logging
-# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -41,9 +25,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
+
 # DB connection — reads from env vars
-# ---------------------------------------------------------------------------
 DB_CONFIG = {
     "host": os.getenv("SOURCE_DB_HOST", "localhost"),
     "port": int(os.getenv("SOURCE_DB_PORT", "5433")),
@@ -52,9 +35,8 @@ DB_CONFIG = {
     "password": os.getenv("SOURCE_DB_PASSWORD", "ecommerce_pass"),
 }
 
-# ---------------------------------------------------------------------------
+
 # Status transition map
-# ---------------------------------------------------------------------------
 VALID_STATUSES = ["pending", "processing", "shipped", "delivered", "cancelled"]
 
 STATUS_TRANSITIONS = {
@@ -71,11 +53,8 @@ NEW_ORDER_STATUSES = ["pending", "pending", "processing"]
 # Invalid statuses
 BAD_STATUSES = ["done", "complete", "PENDING", "Shipped", "unknown"]
 
-# ---------------------------------------------------------------------------
+
 # Helpers
-# ---------------------------------------------------------------------------
-
-
 def get_connection():
     """Open and return a psycopg2 connection."""
     conn = psycopg2.connect(**DB_CONFIG)
@@ -83,23 +62,32 @@ def get_connection():
     return conn
 
 
-def build_rows(count: int) -> list:
+def build_rows(count: int) -> tuple[list, int, int]:
     """
-    Build a list of row tuples to insert.
-    ~90% clean rows, ~10% dirty rows (3 types, rotated evenly).
+    Build insert rows: ~87% clean + ~13% dirty (4 types rotated evenly).
 
-    Returns list of tuples:
-        (customer_id, product_id, quantity, unit_price, status, created_at, updated_at)
+    Dirty types:
+      neg_qty    — negative quantity
+      neg_price  — negative unit_price
+      bad_status — invalid status string
+      duplicate  — exact copy of a randomly chosen clean row (same order data,
+                   new timestamps so updated_at is fresh for CDC)
+
+    Returns:
+        rows      — list of tuples ready for execute_values
+        n_clean   — count of clean rows
+        n_dirty   — count of dirty rows
     """
-    rows = []
+
     now = datetime.now(timezone.utc)
 
-    n_dirty = max(1, count // 10)
+    n_dirty = max(1, count // 8)  # ~12.5% dirty
     n_clean = count - n_dirty
 
     # Clean rows
+    clean_rows = []
     for _ in range(n_clean):
-        rows.append(
+        clean_rows.append(
             (
                 random.randint(1, 500),
                 random.randint(1, 200),
@@ -112,13 +100,14 @@ def build_rows(count: int) -> list:
         )
 
     # Dirty rows
-    dirty_types = ["neg_qty", "neg_price", "bad_status"]
+    dirty_types = ["neg_qty", "neg_price", "bad_status", "duplicate"]
+    dirty_rows = []
 
     for i in range(n_dirty):
-        dtype = dirty_types[i % 3]
+        dtype = dirty_types[i % 4]
 
         if dtype == "neg_qty":
-            rows.append(
+            dirty_rows.append(
                 (
                     random.randint(1, 500),
                     random.randint(1, 200),
@@ -131,7 +120,7 @@ def build_rows(count: int) -> list:
             )
 
         elif dtype == "neg_price":
-            rows.append(
+            dirty_rows.append(
                 (
                     random.randint(1, 500),
                     random.randint(1, 200),
@@ -143,8 +132,8 @@ def build_rows(count: int) -> list:
                 )
             )
 
-        else:
-            rows.append(
+        elif dtype == "bad_status":
+            dirty_rows.append(
                 (
                     random.randint(1, 500),
                     random.randint(1, 200),
@@ -156,12 +145,26 @@ def build_rows(count: int) -> list:
                 )
             )
 
-    return rows
+        else:
+            source = random.choice(clean_rows)
+            dirty_rows.append(
+                (
+                    source[0],
+                    source[1],
+                    source[2],
+                    source[3],
+                    source[4],
+                    now,
+                    now,
+                )
+            )
+
+    return clean_rows + dirty_rows, n_clean, n_dirty
 
 
 def insert_new_orders(cur, count: int) -> dict:
     """
-    Insert `count` new orders (mix of clean and dirty).
+    Insert new orders (mix of clean and dirty).
     Returns counts breakdown: {total, clean, dirty}.
     """
     rows = build_rows(count)
@@ -184,7 +187,7 @@ def insert_new_orders(cur, count: int) -> dict:
 
 def update_existing_orders(cur, count: int) -> int:
     """
-    Pick `count` non-terminal orders at random and advance their status.
+    Pick non-terminal orders at random and advance their status.
 
     Only updates rows with valid statuses from STATUS_TRANSITIONS —
     dirty 'bad_status' rows are intentionally skipped (no valid transition).
@@ -218,8 +221,7 @@ def update_existing_orders(cur, count: int) -> int:
         cur.execute(
             """
             UPDATE orders
-            SET    status     = %s,
-                   updated_at = NOW()
+            SET    status     = %s
             WHERE  order_id   = %s
             """,
             (new_status, order_id),
@@ -256,19 +258,15 @@ def run_once(
     try:
         with conn:
             with conn.cursor() as cur:
-
-                # Inserts
                 insert_stats = insert_new_orders(cur, n_inserts)
                 log.info(
                     f"  Inserted        : {insert_stats['total']} rows "
                     f"({insert_stats['clean']} clean, {insert_stats['dirty']} dirty)"
                 )
 
-                # Updates
                 updated = update_existing_orders(cur, n_updates)
                 log.info(f"  Updated         : {updated} rows")
 
-                # Quick stats
                 cur.execute("SELECT COUNT(*) FROM orders")
                 total = cur.fetchone()[0]
                 log.info(f"  Total rows in DB: {total}")
@@ -285,11 +283,7 @@ def run_once(
         conn.close()
 
 
-# ---------------------------------------------------------------------------
 # CLI
-# ---------------------------------------------------------------------------
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Simulate StreamCart order activity in PostgreSQL."
@@ -297,7 +291,7 @@ def parse_args():
     parser.add_argument(
         "--loop",
         action="store_true",
-        help="Run in a continuous loop (useful for Airflow demos)",
+        help="Run in a continuous loop",
     )
     parser.add_argument(
         "--interval",
