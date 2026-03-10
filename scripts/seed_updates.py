@@ -163,14 +163,7 @@ def build_rows(count: int) -> tuple[list, int, int]:
 
 
 def insert_new_orders(cur, count: int) -> dict:
-    """
-    Insert new orders (mix of clean and dirty).
-    Returns counts breakdown: {total, clean, dirty}.
-    """
-    rows = build_rows(count)
-
-    n_dirty = max(1, count // 10)
-    n_clean = count - n_dirty
+    rows, n_clean, n_dirty = build_rows(count)
 
     execute_values(
         cur,
@@ -221,7 +214,8 @@ def update_existing_orders(cur, count: int) -> int:
         cur.execute(
             """
             UPDATE orders
-            SET    status     = %s
+            SET    status     = %s,
+                   updated_at = NOW()
             WHERE  order_id   = %s
             """,
             (new_status, order_id),

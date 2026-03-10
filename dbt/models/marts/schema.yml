@@ -1,0 +1,70 @@
+version: 2
+
+models:
+  - name: fact_orders
+    description: "Grain: one row per order. Includes all dimensions, metrics, and CDC metadata."
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+      - name: customer_id
+        tests:
+          - not_null
+      - name: product_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_product')
+              field: product_id
+      - name: status
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['pending', 'processing', 'shipped', 'delivered', 'cancelled']
+      - name: total_amount
+        tests:
+          - not_null
+      - name: record_type
+        tests:
+          - accepted_values:
+              values: ['INSERT', 'UPDATE']
+      - name: is_insert
+        tests:
+          - not_null
+      - name: is_update
+        tests:
+          - not_null
+
+  - name: dim_product
+    description: "One row per product with latest known attributes"
+    columns:
+      - name: product_id
+        tests:
+          - unique
+          - not_null
+      - name: product_category
+        tests:
+          - not_null
+
+  - name: dim_date
+    description: "Date dimension covering full range of order dates"
+    columns:
+      - name: date_id
+        tests:
+          - unique
+          - not_null
+      - name: is_weekend
+        tests:
+          - not_null
+
+  - name: mart_data_quality
+    description: "Aggregated quality metrics per pipeline run"
+    columns:
+      - name: pipeline_run_id
+        tests:
+          - unique
+          - not_null
+      - name: quarantine_rate_pct
+        tests:
+          - not_null

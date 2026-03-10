@@ -10,6 +10,8 @@ Task dependency graph:
        ↓ (if rows > 0)
       trigger_glue_job
             ↓
+    copy_into_snowflake
+            ↓
       run_dbt_models
             ↓
   refresh_data_quality_summary
@@ -31,16 +33,15 @@ from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
 log = logging.getLogger(__name__)
 
 
-def notify_on_failure(context: dict) -> None:
-    """
-    Failure callback attached to all tasks via default_args.
-    Logs failure details. Replace log.error with Slack/Email in production.
-    """
-    dag_id = context["dag"].dag_id
-    task_id = context["task"].task_id
-    run_id = context["task_instance"].run_id
-    log_url = context["task_instance"].log_url
+# ---------------------------------------------------------------------------
+# Failure callback
+# ---------------------------------------------------------------------------
 
+def notify_on_failure(context: dict) -> None:
+    dag_id  = context["dag"].dag_id
+    task_id = context["task"].task_id
+    run_id  = context["task_instance"].run_id
+    log_url = context["task_instance"].log_url
     log.error(
         f"TASK FAILED | DAG: {dag_id} | Task: {task_id} | "
         f"Run: {run_id} | Logs: {log_url}"
@@ -59,11 +60,11 @@ DEFAULT_ARGS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Task 1 — check_source_availability
+# ---------------------------------------------------------------------------
+
 def check_postgres_callable() -> bool:
-    """
-    Verifies PostgreSQL source DB is reachable and orders table exists.
-    Raises on failure → Airflow marks task failed and retries (up to 2x).
-    """
     import os
     import psycopg2
 
@@ -78,21 +79,18 @@ def check_postgres_callable() -> bool:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM orders")
             count = cur.fetchone()[0]
-        log.info(f"Source DB reachable -  orders table has {count} rows")
+        log.info(f"Source DB reachable — orders table has {count} rows")
         return True
-
     finally:
         conn.close()
 
 
-def extract_cdc_callable(**context) -> dict:
-    """
-    Calls run_extraction() from cdc_extractor.py.
-    Reads pipeline_mode from Airflow Variable.
-    Pushes result dict to XCom so validate_extract can read it.
-    """
-    import sys
+# ---------------------------------------------------------------------------
+# Task 2 — extract_cdc
+# ---------------------------------------------------------------------------
 
+def extract_cdc_callable(**context) -> dict:
+    import sys
     sys.path.insert(0, "/opt/airflow/scripts")
     from cdc_extractor import run_extraction
 
@@ -100,12 +98,9 @@ def extract_cdc_callable(**context) -> dict:
     log.info(f"CDC extraction mode: {mode}")
 
     result = run_extraction(mode=mode)
-
-    # XCom push — validate_extract and trigger_glue_job will read this
     context["ti"].xcom_push(key="cdc_result", value=result)
     log.info(f"XCom pushed: {json.dumps(result, default=str)}")
 
-    # After a successful FULL load → automatically reset to incremental
     if mode == "full":
         Variable.set("pipeline_mode", "incremental")
         log.info("pipeline_mode reset to 'incremental' after full load")
@@ -113,8 +108,12 @@ def extract_cdc_callable(**context) -> dict:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Task 3 — validate_extract
+# ---------------------------------------------------------------------------
+
 def validate_extract_callable(**context) -> bool:
-    ti = context["ti"]
+    ti         = context["ti"]
     cdc_result = ti.xcom_pull(task_ids="extract_cdc", key="cdc_result")
 
     if not cdc_result:
@@ -122,7 +121,7 @@ def validate_extract_callable(**context) -> bool:
         return False
 
     rows_extracted = cdc_result.get("rows_extracted", 0)
-    s3_uri = cdc_result.get("s3_uri")
+    s3_uri         = cdc_result.get("s3_uri")
 
     log.info(f"rows_extracted={rows_extracted}  s3_uri={s3_uri}")
 
@@ -134,33 +133,111 @@ def validate_extract_callable(**context) -> bool:
     return True
 
 
-def refresh_data_quality_callable(**context) -> None:
-    """
-    Writes one summary row to pipeline_audit table in source Postgres.
-    Power BI Pipeline Health page reads from this table.
+# ---------------------------------------------------------------------------
+# Task 5 — copy_into_snowflake
+# Runs after Glue job completes.
+# Strategy: TRUNCATE + COPY INTO (full reload from S3 curated)
+#
+# Why TRUNCATE every time:
+#   - S3 curated is the single source of truth
+#   - Glue already deduplicates and filters dirty rows
+#   - TRUNCATE + COPY ensures Snowflake always mirrors S3 exactly
+#   - Avoids duplicates from multiple Glue append runs
+#   - At 5-50k rows the performance difference is negligible
+# ---------------------------------------------------------------------------
 
-    Columns:
-      run_id          — Airflow run_id (unique per DAG run)
-      run_date        — logical execution date
-      curated_rows    — estimated from CDC extract count
-      quarantine_rows — estimated ~10% of extracted rows
-      dbt_test_status — 'passed' | 'unknown'
-    """
+def copy_into_snowflake_callable(**context) -> None:
+    import snowflake.connector
+
+    account  = Variable.get("snowflake_account",  default_var="jfrnpct-fk56390")
+    user     = Variable.get("snowflake_user",     default_var="karinazozulia23")
+    password = Variable.get("snowflake_password")
+
+    log.info(f"Connecting to Snowflake account: {account}")
+
+    conn = snowflake.connector.connect(
+        account=account,
+        user=user,
+        password=password,
+        role="SYSADMIN",
+        warehouse="COMPUTE_WH",
+        database="STREAMCART_DB",
+        schema="RAW",
+    )
+
+    try:
+        cur = conn.cursor()
+
+        # ── curated ───────────────────────────────────────────────────────
+        log.info("Loading orders_curated from S3...")
+        cur.execute("TRUNCATE TABLE orders_curated")
+        cur.execute("""
+            COPY INTO orders_curated
+            FROM @streamcart_curated_stage
+            FILE_FORMAT = (TYPE = 'PARQUET')
+            MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+            ON_ERROR = CONTINUE
+        """)
+        curated_rows = cur.fetchone()
+        log.info(f"orders_curated loaded: {curated_rows}")
+
+        # Verify row count
+        cur.execute("SELECT COUNT(*), COUNT(DISTINCT order_id) FROM orders_curated")
+        total, distinct = cur.fetchone()
+        log.info(f"orders_curated: total={total}, distinct_order_ids={distinct}")
+
+        if total != distinct:
+            log.warning(
+                f"Duplicate order_ids detected in curated! "
+                f"total={total} distinct={distinct}"
+            )
+
+        # ── quarantine ────────────────────────────────────────────────────
+        log.info("Loading orders_quarantine from S3...")
+        cur.execute("TRUNCATE TABLE orders_quarantine")
+        cur.execute("""
+            COPY INTO orders_quarantine
+            FROM @streamcart_quarantine_stage
+            FILE_FORMAT = (TYPE = 'PARQUET')
+            MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+            ON_ERROR = CONTINUE
+        """)
+        quarantine_rows = cur.fetchone()
+        log.info(f"orders_quarantine loaded: {quarantine_rows}")
+
+        # Summary log
+        cur.execute(
+            "SELECT rejection_reason, COUNT(*) FROM orders_quarantine "
+            "GROUP BY rejection_reason ORDER BY 2 DESC"
+        )
+        breakdown = cur.fetchall()
+        log.info(f"Quarantine breakdown: {breakdown}")
+
+        cur.close()
+        log.info("copy_into_snowflake completed successfully ✓")
+
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Task 7 — refresh_data_quality_summary
+# ---------------------------------------------------------------------------
+
+def refresh_data_quality_callable(**context) -> None:
     import os
     import psycopg2
 
-    ti = context["ti"]
-    run_id = context["run_id"]
+    ti           = context["ti"]
+    run_id       = context["run_id"]
     logical_date = context["logical_date"].date()
 
-    cdc_result = ti.xcom_pull(task_ids="extract_cdc", key="cdc_result") or {}
+    cdc_result     = ti.xcom_pull(task_ids="extract_cdc", key="cdc_result") or {}
     rows_extracted = cdc_result.get("rows_extracted", 0)
 
-    # ~10% of extracted rows are dirty (matches seed_updates.py logic)
     quarantine_approx = max(0, rows_extracted // 10)
-    curated_approx = rows_extracted - quarantine_approx
+    curated_approx    = rows_extracted - quarantine_approx
 
-    # dbt success flag from BashOperator return value
     dbt_output = ti.xcom_pull(task_ids="run_dbt_models") or ""
     dbt_status = "passed" if "successfully" in str(dbt_output).lower() else "unknown"
 
@@ -184,24 +261,26 @@ def refresh_data_quality_callable(**context) -> None:
                     INSERT INTO pipeline_audit
                         (run_id, run_date, curated_rows, quarantine_rows, dbt_test_status)
                     VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (run_id) DO UPDATE SET
+                        curated_rows    = EXCLUDED.curated_rows,
+                        quarantine_rows = EXCLUDED.quarantine_rows,
+                        dbt_test_status = EXCLUDED.dbt_test_status
                     """,
-                    (
-                        run_id,
-                        logical_date,
-                        curated_approx,
-                        quarantine_approx,
-                        dbt_status,
-                    ),
+                    (run_id, logical_date, curated_approx, quarantine_approx, dbt_status),
                 )
         log.info("Audit row written ✓")
     finally:
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# DAG definition
+# ---------------------------------------------------------------------------
+
 with DAG(
     dag_id="ecommerce_pipeline",
     default_args=DEFAULT_ARGS,
-    description="StreamCart CDC pipeline: Postgres → S3 → Glue → dbt → Audit",
+    description="StreamCart CDC pipeline: Postgres → S3 → Glue → Snowflake → dbt → Audit",
     schedule_interval="@daily",
     catchup=False,
     max_active_runs=1,
@@ -230,6 +309,7 @@ with DAG(
         script_location=None,
         aws_conn_id="aws_default",
         region_name="eu-central-1",
+        iam_role_name="streamcart-glue-role",
         script_args={
             "--S3_INPUT_PATH": (
                 "{{ ti.xcom_pull(task_ids='extract_cdc', key='cdc_result')"
@@ -238,28 +318,42 @@ with DAG(
             "--PIPELINE_RUN_ID": "{{ run_id }}",
         },
         wait_for_completion=True,
-        verbose=True,
+        verbose=False,
+    )
+
+    copy_into_snowflake = PythonOperator(
+        task_id="copy_into_snowflake",
+        python_callable=copy_into_snowflake_callable,
     )
 
     run_dbt_models = BashOperator(
         task_id="run_dbt_models",
         bash_command="""
             set -e
-            cd /opt/airflow/dbt
+            DBT_PROFILES_DIR=/home/airflow/.dbt
+            DBT_PROJECT_DIR=/opt/airflow/dbt
 
             PIPELINE_MODE="{{ var.value.pipeline_mode | default('incremental') }}"
             echo "Pipeline mode: $PIPELINE_MODE"
 
             if [ "$PIPELINE_MODE" = "incremental" ]; then
-                echo "=== dbt run (tag:incremental only) ==="
-                dbt run --select tag:incremental --profiles-dir /opt/airflow/dbt
+                echo "=== dbt run (tag:incremental) ==="
+                dbt run \
+                    --select tag:incremental \
+                    --profiles-dir $DBT_PROFILES_DIR \
+                    --project-dir $DBT_PROJECT_DIR
             else
                 echo "=== dbt run (all models) ==="
-                dbt run --profiles-dir /opt/airflow/dbt
+                dbt run \
+                    --profiles-dir $DBT_PROFILES_DIR \
+                    --project-dir $DBT_PROJECT_DIR
             fi
 
             echo "=== dbt test ==="
-            dbt test --profiles-dir /opt/airflow/dbt
+            dbt test \
+                --profiles-dir $DBT_PROFILES_DIR \
+                --project-dir $DBT_PROJECT_DIR
+
             echo "dbt completed successfully"
         """,
     )
@@ -274,6 +368,7 @@ with DAG(
         >> extract_cdc
         >> validate_extract
         >> trigger_glue_job
+        >> copy_into_snowflake
         >> run_dbt_models
         >> refresh_data_quality_summary
     )

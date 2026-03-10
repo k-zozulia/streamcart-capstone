@@ -140,11 +140,6 @@ deduped_df = (
 
 # Step 7 — Detect INSERT vs UPDATE
 # Compare incoming order_ids with existing curated partition
-#
-# Logic:
-#   - Read existing order_ids from curated Parquet
-#   - If order_id already exists in curated → record_type = UPDATE
-#   - If order_id is new → record_type = INSERT
 
 try:
     existing_df = spark.read.parquet(CURATED_PATH)
@@ -186,7 +181,6 @@ print(f"UPDATE rows: {update_count}")
 
 
 # Step 8 — Build quarantine dataframe
-# Combine all rejected rows with rejection_reason column
 
 quarantine_parts = []
 
@@ -242,9 +236,7 @@ else:
     print("QUARANTINE rows: 0")
 
 
-# Step 9 — Write curated Parquet (partitioned by order_date)
-# mode=append so each pipeline run adds to the partition
-# Glue MERGE handles updates via record_type column
+# Step 9 — Write curated Parquet
 
 curated_count = deduped_with_type.count()
 print(f"CURATED rows: {curated_count}")
