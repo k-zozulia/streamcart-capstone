@@ -81,7 +81,7 @@ def build_rows(count: int) -> tuple[list, int, int]:
 
     now = datetime.now(timezone.utc)
 
-    n_dirty = max(1, count // 8)  # ~12.5% dirty
+    n_dirty = max(1, count // 8)
     n_clean = count - n_dirty
 
     # Clean rows
@@ -245,8 +245,6 @@ def run_once(
 
     log.info("=" * 60)
     log.info("seed_updates.py — starting run")
-    log.info(f"  Planned inserts : {n_inserts}  (~{n_inserts // 10} dirty)")
-    log.info(f"  Planned updates : {n_updates}")
 
     conn = get_connection()
     try:

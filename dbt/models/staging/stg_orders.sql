@@ -18,7 +18,7 @@ staged as (
         cast(is_weekend as boolean)         as is_weekend,
         upper(trim(record_type))            as record_type,
         pipeline_run_id                     as pipeline_run_id,
-        current_timestamp()                 as _extracted_at
+        cast(_extracted_at as timestamp_tz) as _extracted_at
     from source
 )
 

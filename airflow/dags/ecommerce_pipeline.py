@@ -135,15 +135,6 @@ def validate_extract_callable(**context) -> bool:
 
 # ---------------------------------------------------------------------------
 # Task 5 — copy_into_snowflake
-# Runs after Glue job completes.
-# Strategy: TRUNCATE + COPY INTO (full reload from S3 curated)
-#
-# Why TRUNCATE every time:
-#   - S3 curated is the single source of truth
-#   - Glue already deduplicates and filters dirty rows
-#   - TRUNCATE + COPY ensures Snowflake always mirrors S3 exactly
-#   - Avoids duplicates from multiple Glue append runs
-#   - At 5-50k rows the performance difference is negligible
 # ---------------------------------------------------------------------------
 
 def copy_into_snowflake_callable(**context) -> None:
@@ -152,6 +143,7 @@ def copy_into_snowflake_callable(**context) -> None:
     account  = Variable.get("snowflake_account",  default_var="jfrnpct-fk56390")
     user     = Variable.get("snowflake_user",     default_var="karinazozulia23")
     password = Variable.get("snowflake_password")
+    run_id   = context["run_id"]
 
     log.info(f"Connecting to Snowflake account: {account}")
 
@@ -168,9 +160,13 @@ def copy_into_snowflake_callable(**context) -> None:
     try:
         cur = conn.cursor()
 
-        # ── curated ───────────────────────────────────────────────────────
-        log.info("Loading orders_curated from S3...")
+        # ── CURATED: TRUNCATE + COPY INTO ─────────────────────────────────
+        # orders_curated is a staging table — holds only the current batch.
+        # S3 curated is the single source of truth with full history.
+        log.info("Loading orders_curated via TRUNCATE + COPY INTO...")
+
         cur.execute("TRUNCATE TABLE orders_curated")
+
         cur.execute("""
             COPY INTO orders_curated
             FROM @streamcart_curated_stage
@@ -178,23 +174,21 @@ def copy_into_snowflake_callable(**context) -> None:
             MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
             ON_ERROR = CONTINUE
         """)
-        curated_rows = cur.fetchone()
-        log.info(f"orders_curated loaded: {curated_rows}")
 
-        # Verify row count
-        cur.execute("SELECT COUNT(*), COUNT(DISTINCT order_id) FROM orders_curated")
-        total, distinct = cur.fetchone()
-        log.info(f"orders_curated: total={total}, distinct_order_ids={distinct}")
+        cur.execute("UPDATE orders_curated SET _extracted_at = CURRENT_TIMESTAMP()")
+        log.info("_extracted_at stamped on all curated rows")
 
-        if total != distinct:
-            log.warning(
-                f"Duplicate order_ids detected in curated! "
-                f"total={total} distinct={distinct}"
-            )
+        cur.execute("SELECT COUNT(*) FROM orders_curated")
+        curated_count = cur.fetchone()[0]
+        log.info(f"orders_curated loaded: {curated_count} rows")
 
-        # ── quarantine ────────────────────────────────────────────────────
-        log.info("Loading orders_quarantine from S3...")
+        # ── QUARANTINE: TRUNCATE + COPY INTO ──────────────────────────────
+        # Quarantine history is preserved in S3.
+        # Snowflake quarantine table holds only current batch for dbt.
+        log.info("Loading orders_quarantine via TRUNCATE + COPY INTO...")
+
         cur.execute("TRUNCATE TABLE orders_quarantine")
+
         cur.execute("""
             COPY INTO orders_quarantine
             FROM @streamcart_quarantine_stage
@@ -202,16 +196,21 @@ def copy_into_snowflake_callable(**context) -> None:
             MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
             ON_ERROR = CONTINUE
         """)
-        quarantine_rows = cur.fetchone()
-        log.info(f"orders_quarantine loaded: {quarantine_rows}")
 
-        # Summary log
-        cur.execute(
-            "SELECT rejection_reason, COUNT(*) FROM orders_quarantine "
-            "GROUP BY rejection_reason ORDER BY 2 DESC"
-        )
-        breakdown = cur.fetchall()
-        log.info(f"Quarantine breakdown: {breakdown}")
+        cur.execute("SELECT COUNT(*) FROM orders_quarantine")
+        quarantine_count = cur.fetchone()[0]
+        log.info(f"orders_quarantine loaded: {quarantine_count} rows")
+
+        # Breakdown by rejection reason
+        if quarantine_count > 0:
+            cur.execute("""
+                SELECT rejection_reason, COUNT(*)
+                FROM orders_quarantine
+                GROUP BY 1
+                ORDER BY 2 DESC
+            """)
+            breakdown = cur.fetchall()
+            log.info(f"Quarantine breakdown: {breakdown}")
 
         cur.close()
         log.info("copy_into_snowflake completed successfully ✓")
