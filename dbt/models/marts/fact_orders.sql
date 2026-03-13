@@ -15,9 +15,9 @@ with quality as (
     select * from {{ ref('int_orders_quality_flags') }}
 
     {% if is_incremental() %}
-        where _extracted_at > (
-            select max(_extracted_at) from {{ this }}
-        )
+    where _extracted_at > (
+        select coalesce(max(_extracted_at), '2000-01-01') from {{ this }}
+    )
     {% endif %}
 ),
 

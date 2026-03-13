@@ -260,10 +260,6 @@ def refresh_data_quality_callable(**context) -> None:
                     INSERT INTO pipeline_audit
                         (run_id, run_date, curated_rows, quarantine_rows, dbt_test_status)
                     VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (run_id) DO UPDATE SET
-                        curated_rows    = EXCLUDED.curated_rows,
-                        quarantine_rows = EXCLUDED.quarantine_rows,
-                        dbt_test_status = EXCLUDED.dbt_test_status
                     """,
                     (run_id, logical_date, curated_approx, quarantine_approx, dbt_status),
                 )
