@@ -38,10 +38,32 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def notify_on_failure(context: dict) -> None:
+    # SlackWebhookOperator equivalent — uses requests directly due to
+    # provider version compatibility issue with apache-airflow-providers-slack==8.5.0
+    import requests
+    from airflow.hooks.base import BaseHook
+
     dag_id  = context["dag"].dag_id
     task_id = context["task"].task_id
     run_id  = context["task_instance"].run_id
     log_url = context["task_instance"].log_url
+
+    conn = BaseHook.get_connection("slack_default")
+    webhook_url = conn.host
+
+    requests.post(
+        webhook_url,
+        json={
+            "text": (
+                f":red_circle: *StreamCart Pipeline Failure*\n"
+                f"*DAG:* {dag_id}\n"
+                f"*Task:* {task_id}\n"
+                f"*Run ID:* {run_id}\n"
+                f"*Logs:* {log_url}"
+            )
+        }
+    )
+
     log.error(
         f"TASK FAILED | DAG: {dag_id} | Task: {task_id} | "
         f"Run: {run_id} | Logs: {log_url}"
