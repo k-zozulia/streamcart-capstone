@@ -267,6 +267,26 @@ def refresh_data_quality_callable(**context) -> None:
     finally:
         conn.close()
 
+    import json
+    from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+
+    audit_record = {
+        "run_id": run_id,
+        "run_date": str(logical_date),
+        "curated_rows": curated_approx,
+        "quarantine_rows": quarantine_approx,
+        "dbt_test_status": dbt_status,
+    }
+
+    bucket = Variable.get("s3_bucket", default_var="karina-ecommerce-lakehouse")
+    s3_client = S3Hook(aws_conn_id="aws_default").get_conn()
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=f"ecommerce/audit/run_date={logical_date}/audit_{run_id}.json",
+        Body=json.dumps(audit_record).encode("utf-8"),
+        ContentType="application/json",
+    )
+    log.info(f"Audit JSON written to s3://{bucket}/ecommerce/audit/run_date={logical_date}/")
 
 # ---------------------------------------------------------------------------
 # DAG definition
