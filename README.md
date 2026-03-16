@@ -6,7 +6,6 @@ End-to-end production data pipeline for e-commerce analytics.
 ---
 
 ## Architecture
-
 ```
 PostgreSQL (Docker) → CDC Extractor → S3 Raw → Glue ETL → S3 Curated
                                                                ↓
@@ -22,7 +21,6 @@ Full architecture details: [docs/architecture.md](docs/architecture.md)
 ---
 
 ## Project Structure
-
 ```
 streamcart-capstone/
 ├── docker/
@@ -33,7 +31,8 @@ streamcart-capstone/
 │   └── seed_updates.py          # Simulates ongoing inserts/updates
 ├── airflow/
 │   └── dags/
-│       └── ecommerce_pipeline.py  # Main DAG (7 tasks)
+│       ├── ecommerce_pipeline.py  # Main DAG (7 tasks, daily schedule)
+│       └── ecommerce_full_load.py # Manual full load DAG (trigger only)
 ├── glue_jobs/
 │   └── raw_to_curated.py        # PySpark ETL job
 ├── dbt/
@@ -87,7 +86,6 @@ aws s3 cp glue_jobs/raw_to_curated.py \
 ### Step 2 — Snowflake Setup
 
 Run in Snowflake Worksheet as ACCOUNTADMIN:
-
 ```sql
 -- Storage Integration
 CREATE STORAGE INTEGRATION streamcart_s3_integration
@@ -104,7 +102,6 @@ DESC INTEGRATION streamcart_s3_integration;
 -- Copy STORAGE_AWS_IAM_USER_ARN and STORAGE_AWS_EXTERNAL_ID
 -- Update trust policy on streamcart-glue-role in AWS IAM
 ```
-
 ```sql
 -- Database and schemas
 USE ROLE SYSADMIN;
@@ -143,7 +140,6 @@ CREATE TABLE IF NOT EXISTS STREAMCART_DB.RAW.orders_quarantine (
 ```
 
 ### Step 3 — dbt Setup
-
 ```bash
 cd dbt
 pip install dbt-snowflake==1.8.4
@@ -169,7 +165,6 @@ streamcart:
 ```
 
 ### Step 4 — Start Docker
-
 ```bash
 # Create .env file
 cat > docker/.env << 'ENV'
@@ -196,6 +191,7 @@ Open http://localhost:8080 (admin/admin)
 |--------------|------|---------|
 | `aws_default` | Amazon Web Services | Login=ACCESS_KEY, Password=SECRET_KEY, Extra=`{"region_name":"eu-central-1"}` |
 | `postgres_source` | Postgres | Host=source-postgres, DB=ecommerce, Login=ecommerce_user, Pass=ecommerce_pass, Port=5432 |
+| `slack_default` | Slack Incoming Webhook | Slack Webhook Endpoint=your_webhook_url, Webhook Token=T.../B.../... |
 
 **Admin → Variables → +:**
 
@@ -210,12 +206,13 @@ Open http://localhost:8080 (admin/admin)
 | `snowflake_password` | `<your_password>` |
 
 ### Step 6 — Seed Data
-
 ```bash
 python scripts/seed_updates.py
 ```
 
 ### Step 7 — Run Pipeline
+
+**Scheduled incremental pipeline (runs daily automatically):**
 
 In Airflow UI → `ecommerce_pipeline` → **Trigger DAG ▶️**
 
@@ -228,10 +225,16 @@ Expected task sequence (all green):
 6. `run_dbt_models` (~2 min)
 7. `refresh_data_quality_summary` (~2s)
 
+**Initial full load or disaster recovery:**
+
+In Airflow UI → `ecommerce_full_load` → **Trigger DAG ▶️**
+
+This DAG automatically sets `pipeline_mode=full`, resets the watermark to `2020-01-01`,
+runs the complete pipeline, then resets back to `incremental` mode.
+
 ---
 
 ## Running Incremental Updates
-
 ```bash
 # Add new data to PostgreSQL
 python scripts/seed_updates.py
@@ -243,7 +246,6 @@ python scripts/seed_updates.py
 ---
 
 ## dbt Commands
-
 ```bash
 cd dbt
 
@@ -274,6 +276,14 @@ To demonstrate the ShortCircuitOperator:
 
 ---
 
+## Failure Alerts
+
+Pipeline failures trigger a Slack notification to the configured webhook.
+To set up: create a Slack Incoming Webhook and add it as `slack_default` connection in Airflow
+(Admin → Connections → slack_default → Slack Incoming Webhook).
+
+---
+
 ## Snowflake Note
 
 This project uses `dbt-snowflake` with data loaded via `COPY INTO` from S3 External Stage,
@@ -283,9 +293,3 @@ rather than `dbt-glue`. This approach was chosen because:
 - No additional Glue catalog configuration required
 
 See `docs/architecture.md` for full details.
-
----
-
-## Teardown
-
-See [docs/teardown_checklist.md](docs/teardown_checklist.md) for complete AWS cleanup steps.
