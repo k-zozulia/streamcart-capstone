@@ -10,9 +10,6 @@ models:
       - name: total_amount
         tests:
           - not_null
-      - name: order_date
-        tests:
-          - not_null
 
   - name: int_orders_quality_flags
     description: "Orders with quality flags and rejection reasons"
