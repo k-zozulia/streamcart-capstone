@@ -129,5 +129,4 @@ discover these partitions automatically without a crawler.
 |--------|-------|--------|
 | rows_extracted = 0 | Airflow task log | ShortCircuitOperator skips downstream |
 | S3 write failure | Airflow + CloudWatch | notify_on_failure callback fires |
-| quarantine_rate > 5% | mart_data_quality | Bonus: Anomaly Detection task |
 | Source freshness | dbt source freshness | warn_after: 25h, error_after: 49h |
