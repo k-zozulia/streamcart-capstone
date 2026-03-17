@@ -83,7 +83,7 @@ Trade-offs:
 - Con: slightly larger batches per run
 - Recommended lookback: 2x the maximum observed replica lag
 
-**Alternative — WAL-Based CDC (Bonus +10pts):**
+**Alternative — WAL-Based CDC:**
 
 Use Debezium with PostgreSQL logical replication. Debezium streams every row change
 the moment it is committed to the WAL, eliminating the late-arrival problem entirely.
